@@ -217,3 +217,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .
 #lockbtn { margin-left: 8px; }
 #updated:not(:empty)::after { content: " ·"; }
 .item .side .caseno { margin-top: 0; }
+.watch.pending { background: linear-gradient(90deg, var(--cream), transparent 80%); padding-left: 12px; }
+.watch.pending .who { margin: 0; }
+.track .hint code { font-size: .85em; }

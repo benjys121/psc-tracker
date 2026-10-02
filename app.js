@@ -1,8 +1,11 @@
 const view = document.getElementById("view");
 const PW_KEY = "psc-tracker-pw";
 const SEEN_KEY = "psc-tracker-seen";
-let DATA = null; // decrypted bundle: { cases: [...], briefings: [...] }
+const PENDING_KEY = "psc-tracker-pending";
+const MARKER = "requested from the dashboard"; // the Slack bot looks for this (psc/slackbot.py)
+let DATA = null; // decrypted bundle: { cases: [...], briefings: [...], webhook }
 let BUILT_AT = null;
+let PASSWORD = null;
 
 /* ---------- helpers ---------- */
 
@@ -109,6 +112,7 @@ function showLock(message = "") {
 async function unlock(pw) {
   const blob = await fetchBlob();
   DATA = await decrypt(blob, pw);
+  PASSWORD = pw;
   BUILT_AT = blob.built_at;
   document.body.classList.remove("locked");
   document.getElementById("updated").textContent = BUILT_AT
@@ -140,6 +144,103 @@ function markSeen(c) {
   storage.set(SEEN_KEY, map);
 }
 
+/* ---------- track / untrack (sent through Slack; the bot on the Mac applies them) ---------- */
+
+function normalizeCase(raw) {
+  const s = (raw || "").replace(/\s+/g, "").toUpperCase();
+  let m = s.match(/^(\d{2})-([A-Z]{1,2})-(\d{1,4})$/);
+  if (m) return `${m[1]}-${m[2]}-${m[3].padStart(4, "0")}`;
+  m = s.match(/^(\d{2})-(\d{1,5})$/);
+  return m ? `${m[1]}-${m[2].padStart(5, "0")}` : null;
+}
+
+const isTracked = (caseNo) => DATA.cases.some((c) => c.case === caseNo);
+
+// Pending requests, dropped once the published data reflects them (or after an hour).
+function pending() {
+  const now = Date.now();
+  const list = storage
+    .get(PENDING_KEY, [])
+    .filter((p) => now - p.at < 36e5 && (p.action === "track" ? !isTracked(p.case) : isTracked(p.case)));
+  storage.set(PENDING_KEY, list);
+  return list;
+}
+const pendingFor = (caseNo) => pending().find((p) => p.case === caseNo);
+
+async function sendCommand(action, cases) {
+  if (!DATA.webhook) throw new Error("Tracking from the dashboard isn't set up (no Slack webhook).");
+  // Slack's webhook sends no CORS headers, so post a form-encoded payload in no-cors mode.
+  // The response is unreadable; the bot confirms in the Slack thread.
+  await fetch(DATA.webhook, {
+    method: "POST",
+    mode: "no-cors",
+    body: new URLSearchParams({ payload: JSON.stringify({ text: `${action} ${cases.join(", ")} — ${MARKER}` }) }),
+  });
+  const list = storage.get(PENDING_KEY, []).filter((p) => !cases.includes(p.case));
+  cases.forEach((c) => list.push({ action, case: c, at: Date.now() }));
+  storage.set(PENDING_KEY, list);
+  watchForUpdates();
+}
+
+// While requests are pending, re-download the published data and re-render when it changes.
+let refreshTimer = null;
+function watchForUpdates() {
+  if (refreshTimer) return;
+  refreshTimer = setInterval(async () => {
+    if (!pending().length) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+      return;
+    }
+    try {
+      const blob = await fetchBlob();
+      if (blob.built_at === BUILT_AT) return;
+      DATA = await decrypt(blob, PASSWORD);
+      BUILT_AT = blob.built_at;
+      route(false);
+    } catch {}
+  }, 45000);
+}
+
+async function onTrack(e) {
+  e.preventDefault();
+  const form = e.target;
+  const problems = document.getElementById("problems");
+  const tokens = form.cases.value.split(/[\s,]+/).filter(Boolean);
+  const bad = tokens.filter((t) => !normalizeCase(t));
+  const cases = [...new Set(tokens.map(normalizeCase).filter(Boolean))];
+  const already = cases.filter(isTracked);
+  const toAdd = cases.filter((c) => !isTracked(c));
+  const notes = [
+    ...bad.map((t) => `“${t}” doesn't look like a case number (try 25-E-0375).`),
+    ...already.map((c) => `${c} is already tracked.`),
+  ];
+  if (!toAdd.length) {
+    problems.innerHTML = notes.map(esc).join("<br>") || "Enter a case number.";
+    return;
+  }
+  const btn = form.querySelector("button");
+  btn.disabled = true;
+  try {
+    await sendCommand("track", toAdd);
+    renderWatchlist();
+    document.getElementById("problems").innerHTML = notes.map(esc).join("<br>");
+  } catch (err) {
+    problems.textContent = err.message;
+    btn.disabled = false;
+  }
+}
+
+async function onUntrack(caseNo) {
+  if (!confirm(`Stop tracking ${caseNo}? This posts to the Slack channel for everyone.`)) return;
+  try {
+    await sendCommand("untrack", [caseNo]);
+  } catch (err) {
+    alert(err.message);
+  }
+  route(false);
+}
+
 /* ---------- watchlist ---------- */
 
 function filingRow(f, seen) {
@@ -164,7 +265,13 @@ function watchCard(c) {
     <div class="watch-side">
       <a class="caseno" href="#/case/${esc(c.case)}">${esc(c.case)}</a>
       <div class="kicker">${esc(kind)}</div>
-      ${newCount ? `<span class="tag gold">${newCount} new</span>` : `<span class="tag">Up to date</span>`}
+      ${
+        pendingFor(c.case)
+          ? `<span class="tag ink">Removing…</span>`
+          : newCount
+          ? `<span class="tag gold">${newCount} new</span>`
+          : `<span class="tag">Up to date</span>`
+      }
       <div class="count">${c.filings.length.toLocaleString()} filings${latest ? ` · last ${rel ? rel.toLowerCase() : shortDate(latest)}` : ""}</div>
     </div>
     <div class="watch-main">
@@ -175,6 +282,7 @@ function watchCard(c) {
         <a class="textbtn" href="#/case/${esc(c.case)}">All ${c.filings.length.toLocaleString()} filings</a>
         ${newCount ? `<button class="textbtn" data-act="seen">Mark as read</button>` : ""}
         <a class="textbtn quiet" href="${esc(m.url)}" target="_blank" rel="noopener">Open on DPS ↗</a>
+        ${pendingFor(c.case) ? "" : `<button class="textbtn quiet" data-act="untrack">Stop tracking</button>`}
       </div>
     </div>
   </article>`;
@@ -184,20 +292,36 @@ function renderWatchlist() {
   setNav("watch");
   const cases = [...DATA.cases].sort((a, b) => (b.filings[0]?.date || "").localeCompare(a.filings[0]?.date || ""));
   const totalNew = cases.reduce((n, c) => n + c.filings.filter((f) => f.filing_seq > lastSeen(c)).length, 0);
+  const adding = pending().filter((p) => p.action === "track");
   view.innerHTML = `
-    <div class="track howto">
-      <label>Track a proceeding</label>
-      <p>Post <code>track 25-E-0375</code> in the Slack channel. The bot confirms in a thread, and the case shows up here within a few minutes. <code>untrack 25-E-0375</code> removes it; <code>tracked</code> lists everything.</p>
-    </div>
+    <form class="track" id="track">
+      <label for="cases">Track a proceeding</label>
+      <div class="track-row">
+        <input id="cases" name="cases" autocomplete="off" placeholder="25-E-0375" required>
+        <button class="btn" type="submit">Track</button>
+      </div>
+      <p class="hint">One or more PSC case numbers, separated by commas. The request goes to the Slack channel, the bot confirms there, and the case appears here in a few minutes. You can also post <code>track 25-E-0375</code> in Slack.</p>
+      <div class="problems" id="problems"></div>
+    </form>
     <h2 class="section-head">Tracked cases</h2>
+    ${adding
+      .map(
+        (p) => `<article class="watch pending"><div class="watch-side"><span class="caseno">${esc(p.case)}</span><span class="tag ink">Adding…</span></div>
+        <div class="watch-main"><p class="who">Requested ${Math.max(1, Math.round((Date.now() - p.at) / 6e4))} min ago. The bot confirms in Slack (or says if the case doesn't exist), and the full history appears here once the dashboard rebuilds, usually within five minutes. This page checks automatically.</p></div></article>`
+      )
+      .join("")}
     ${
-      !cases.length
-        ? `<div class="empty"><p><strong>Nothing tracked yet.</strong> Post <code>track</code> and a case number in Slack to add one.</p></div>`
+      !cases.length && !adding.length
+        ? `<div class="empty"><p><strong>Nothing tracked yet.</strong> Add a case number above.</p></div>`
         : (totalNew
             ? `<p class="dek"><strong>${totalNew} new filing${totalNew === 1 ? "" : "s"}</strong> since your last visit.</p>`
             : `<p class="dek">No new filings in the ${cases.length} tracked case${cases.length === 1 ? "" : "s"} since your last visit.</p>`) +
           cases.map(watchCard).join("")
     }`;
+  document.getElementById("track").addEventListener("submit", onTrack);
+  view.querySelectorAll('[data-act="untrack"]').forEach((btn) =>
+    btn.addEventListener("click", () => onUntrack(btn.closest(".watch").dataset.case))
+  );
   view.querySelectorAll('[data-act="seen"]').forEach((btn) =>
     btn.addEventListener("click", () => {
       markSeen(DATA.cases.find((c) => c.case === btn.closest(".watch").dataset.case));
@@ -215,8 +339,13 @@ function renderCase(caseNo) {
   const c = DATA.cases.find((x) => x.case === caseNo);
   if (!c) {
     view.innerHTML = `<a class="textbtn back" href="#/">← Tracked cases</a>
-      <div class="empty"><p><strong>${esc(caseNo)} isn't tracked.</strong> Post <code>track ${esc(caseNo)}</code> in Slack to add it, or
-      <a class="doc" href="https://documents.dps.ny.gov/public/MatterManagement/CaseMaster.aspx?MatterCaseNo=${encodeURIComponent(caseNo)}" target="_blank" rel="noopener">open it on the DPS site</a>.</p></div>`;
+      <div class="empty"><p><strong>${esc(caseNo)} isn't tracked${pendingFor(caseNo) ? " yet. It's been requested and will appear here in a few minutes" : ""}.</strong>
+      <a class="doc" href="https://documents.dps.ny.gov/public/MatterManagement/CaseMaster.aspx?MatterCaseNo=${encodeURIComponent(caseNo)}" target="_blank" rel="noopener">Open it on the DPS site</a>.</p>
+      ${pendingFor(caseNo) ? "" : `<button class="btn" id="trackbtn">Track ${esc(caseNo)}</button>`}</div>`;
+    document.getElementById("trackbtn")?.addEventListener("click", async () => {
+      await sendCommand("track", [caseNo]).catch((err) => alert(err.message));
+      renderCase(caseNo);
+    });
     return;
   }
   const m = c.meta || {};
@@ -240,6 +369,7 @@ function renderCase(caseNo) {
       <div class="case-actions">
         <a class="btn ghost" href="${esc(m.url)}" target="_blank" rel="noopener">Open on DPS ↗</a>
         <span class="kicker">Tracked since ${esc(shortDate(c.added_at))}</span>
+        ${pendingFor(c.case) ? `<span class="tag ink">Removing…</span>` : `<button class="textbtn quiet" id="untrackbtn">Stop tracking</button>`}
       </div>
     </header>
     <div class="filters">
@@ -294,6 +424,7 @@ function renderCase(caseNo) {
   };
   draw();
   markSeen(c); // opening the full case counts as reading it
+  document.getElementById("untrackbtn")?.addEventListener("click", () => onUntrack(c.case));
 
   document.getElementById("q").addEventListener("input", (e) => {
     state.q = e.target.value;
@@ -356,15 +487,16 @@ function renderBriefing(day) {
 
 /* ---------- router ---------- */
 
-function route() {
+function route(scroll = true) {
   if (!DATA) return;
   const [, page, arg] = location.hash.split("/");
-  window.scrollTo(0, 0);
+  if (scroll) window.scrollTo(0, 0);
+  if (pending().length) watchForUpdates();
   if (page === "case" && arg) renderCase(decodeURIComponent(arg));
   else if (page === "briefing") renderBriefing(arg);
   else renderWatchlist();
 }
-window.addEventListener("hashchange", route);
+window.addEventListener("hashchange", () => route());
 
 (async () => {
   const saved = storage.get(PW_KEY, null);
