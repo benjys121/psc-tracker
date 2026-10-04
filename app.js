@@ -121,12 +121,6 @@ async function unlock(pw) {
   route();
 }
 
-document.getElementById("lockbtn").addEventListener("click", () => {
-  storage.remove(PW_KEY);
-  DATA = null;
-  showLock();
-});
-
 /* ---------- "new since your last visit" (per browser) ---------- */
 
 const seenMap = () => storage.get(SEEN_KEY, {});
@@ -155,31 +149,93 @@ function normalizeCase(raw) {
 }
 
 const isTracked = (caseNo) => DATA.cases.some((c) => c.case === caseNo);
+const caseObj = (caseNo) => DATA.cases.find((c) => c.case === caseNo);
+const lc = (s) => (s || "").toLowerCase();
+const cleanCategory = (s) => (s || "").replace(/^[\s"'`#.,;:—–-]+|[\s"'`#.,;:—–-]+$/g, "").replace(/\s+/g, " ").slice(0, 40);
 
-// Pending requests, dropped once the published data reflects them (or after an hour).
+// Requests sent to Slack but not yet reflected in the published data. Stars and categories are
+// shown optimistically from these; each is dropped once the data matches (or after an hour).
+const opKey = (p) =>
+  p.action.endsWith("track") ? `track:${p.case}` :
+  p.action.endsWith("star") ? `star:${p.case}` :
+  p.action.endsWith("tag") ? `tag:${p.case}:${lc(p.name)}` : `cat:${lc(p.name)}`;
+
+function resolved(p) {
+  const c = p.case && caseObj(p.case);
+  switch (p.action) {
+    case "track": return !!c;
+    case "untrack": return !c;
+    case "star": return !c || c.starred;
+    case "unstar": return !c || !c.starred;
+    case "tag": return !c || (c.categories || []).some((x) => lc(x) === lc(p.name));
+    case "untag": return !c || !(c.categories || []).some((x) => lc(x) === lc(p.name));
+    case "newcat": return (DATA.categories || []).some((x) => lc(x) === lc(p.name));
+    case "delcat": return !(DATA.categories || []).some((x) => lc(x) === lc(p.name));
+  }
+  return true;
+}
+
 function pending() {
   const now = Date.now();
-  const list = storage
-    .get(PENDING_KEY, [])
-    .filter((p) => now - p.at < 36e5 && (p.action === "track" ? !isTracked(p.case) : isTracked(p.case)));
+  const list = storage.get(PENDING_KEY, []).filter((p) => p.action && now - p.at < 36e5 && !resolved(p));
   storage.set(PENDING_KEY, list);
   return list;
 }
-const pendingFor = (caseNo) => pending().find((p) => p.case === caseNo);
+const pendingFor = (caseNo) => pending().find((p) => p.case === caseNo && p.action.endsWith("track"));
 
-async function sendCommand(action, cases) {
-  if (!DATA.webhook) throw new Error("Tracking from the dashboard isn't set up (no Slack webhook).");
+// Effective (optimistic) state
+function isStarred(c) {
+  const p = pending().find((p) => p.case === c.case && p.action.endsWith("star"));
+  return p ? p.action === "star" : !!c.starred;
+}
+function categoriesOf(c) {
+  const deleted = pending().filter((p) => p.action === "delcat").map((p) => lc(p.name));
+  let cats = (c.categories || []).filter((x) => !deleted.includes(lc(x)));
+  for (const p of pending().filter((p) => p.case === c.case)) {
+    if (p.action === "tag" && !cats.some((x) => lc(x) === lc(p.name))) cats = [...cats, p.name];
+    if (p.action === "untag") cats = cats.filter((x) => lc(x) !== lc(p.name));
+  }
+  return cats;
+}
+function allCategories() {
+  const seen = new Map();
+  const add = (n) => n && !seen.has(lc(n)) && seen.set(lc(n), n);
+  (DATA.categories || []).forEach(add);
+  pending().filter((p) => p.action === "newcat" || p.action === "tag").forEach((p) => add(p.name));
+  pending().filter((p) => p.action === "delcat").forEach((p) => seen.delete(lc(p.name)));
+  return [...seen.values()].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+}
+
+const COMMAND_TEXT = { newcat: "category add", delcat: "category delete" };
+
+async function sendCommand(action, cases = [], names = []) {
+  if (!DATA.webhook) throw new Error("Changes from the dashboard aren't set up (no Slack webhook).");
+  const text = [COMMAND_TEXT[action] || action, cases.join(", "), names.join(", ")].filter(Boolean).join(" ");
   // Slack's webhook sends no CORS headers, so post a form-encoded payload in no-cors mode.
-  // The response is unreadable; the bot confirms in the Slack thread.
+  // The response is unreadable; the bot applies it (and replies in Slack only when needed).
   await fetch(DATA.webhook, {
     method: "POST",
     mode: "no-cors",
-    body: new URLSearchParams({ payload: JSON.stringify({ text: `${action} ${cases.join(", ")} — ${MARKER}` }) }),
+    body: new URLSearchParams({ payload: JSON.stringify({ text: `${text} — ${MARKER}` }) }),
   });
-  const list = storage.get(PENDING_KEY, []).filter((p) => !cases.includes(p.case));
-  cases.forEach((c) => list.push({ action, case: c, at: Date.now() }));
+  const ops = [];
+  if (cases.length && names.length) cases.forEach((c) => names.forEach((n) => ops.push({ action, case: c, name: n })));
+  else if (cases.length) cases.forEach((c) => ops.push({ action, case: c }));
+  else names.forEach((n) => ops.push({ action, name: n }));
+  const keys = new Set(ops.map(opKey));
+  const list = storage.get(PENDING_KEY, []).filter((p) => p.action && !keys.has(opKey(p)));
+  ops.forEach((o) => list.push({ ...o, at: Date.now() }));
   storage.set(PENDING_KEY, list);
   watchForUpdates();
+}
+
+async function act(action, cases, names) {
+  try {
+    await sendCommand(action, cases, names);
+  } catch (err) {
+    alert(err.message);
+  }
+  route(false);
 }
 
 // While requests are pending, re-download the published data and re-render when it changes.
@@ -199,7 +255,7 @@ function watchForUpdates() {
       BUILT_AT = blob.built_at;
       route(false);
     } catch {}
-  }, 45000);
+  }, 30000);
 }
 
 async function onTrack(e) {
@@ -231,17 +287,88 @@ async function onTrack(e) {
   }
 }
 
-async function onUntrack(caseNo) {
-  if (!confirm(`Stop tracking ${caseNo}? This posts to the Slack channel for everyone.`)) return;
-  try {
-    await sendCommand("untrack", [caseNo]);
-  } catch (err) {
-    alert(err.message);
-  }
-  route(false);
+/* ---------- stars and categories (shared by the watchlist and case pages) ---------- */
+
+function starButton(c) {
+  const on = isStarred(c);
+  return `<button class="star${on ? " on" : ""}" data-act="${on ? "unstar" : "star"}" data-case="${esc(c.case)}"
+    aria-pressed="${on}" title="${on ? "Unstar" : "Star"} ${esc(c.case)}">${on ? "★" : "☆"}</button>`;
 }
 
+function categoryPills(c) {
+  return `<div class="pills">${categoriesOf(c)
+    .map((n) => `<span class="pill">${esc(n)}<button data-act="untag" data-case="${esc(c.case)}" data-name="${esc(n)}" aria-label="Remove ${esc(n)} from ${esc(c.case)}">×</button></span>`)
+    .join("")}<button class="pill add" data-act="addcat" data-case="${esc(c.case)}">+ Category</button></div>`;
+}
+
+function categoryInput(caseNo) {
+  const id = `cat-${caseNo}`;
+  return `<form class="catform" data-case="${esc(caseNo)}">
+    <input name="name" list="${id}" placeholder="rate case, transmission…" autocomplete="off" aria-label="Category for ${esc(caseNo)}" required>
+    <datalist id="${id}">${allCategories().map((n) => `<option value="${esc(n)}">`).join("")}</datalist>
+    <button class="btn small" type="submit">Add</button>
+    <button class="textbtn quiet" type="button" data-act="cancelcat">Cancel</button>
+  </form>`;
+}
+
+// One delegated handler for star / category / filter clicks anywhere in the view.
+view.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-act]");
+  if (!el || !DATA) return;
+  const { act: a, case: caseNo, name } = el.dataset;
+  if (a === "star" || a === "unstar") act(a, [caseNo]);
+  else if (a === "untag") act("untag", [caseNo], [name]);
+  else if (a === "addcat") {
+    el.closest(".pills").outerHTML = categoryInput(caseNo);
+    view.querySelector(`.catform[data-case="${caseNo}"] input`).focus();
+  } else if (a === "cancelcat") route(false);
+  else if (a === "untrack") {
+    if (confirm(`Stop tracking ${caseNo}?`)) act("untrack", [caseNo]);
+  } else if (a === "filter") {
+    setPrefs({ filter: el.dataset.filter });
+    renderWatchlist();
+  } else if (a === "newcat") {
+    const n = cleanCategory(prompt("New category name (e.g. rate case, transmission):") || "");
+    if (n) act("newcat", [], [n]);
+  } else if (a === "delcat") {
+    if (confirm(`Delete the category “${name}”? It's removed from every case, but the cases stay tracked.`)) {
+      if (lc(getPrefs().filter) === lc(`cat:${name}`)) setPrefs({ filter: "all" });
+      act("delcat", [], [name]);
+    }
+  } else if (a === "editcats") {
+    editingCategories = !editingCategories;
+    renderWatchlist();
+  }
+});
+view.addEventListener("submit", (e) => {
+  const form = e.target.closest(".catform");
+  if (!form) return;
+  e.preventDefault();
+  const names = form.name.value.split(",").map(cleanCategory).filter(Boolean);
+  // Reuse an existing category's spelling when it only differs by case.
+  const canon = (n) => allCategories().find((x) => lc(x) === lc(n)) || n;
+  if (names.length) act("tag", [form.dataset.case], names.map(canon));
+});
+
 /* ---------- watchlist ---------- */
+
+const PREFS_KEY = "psc-tracker-view";
+const getPrefs = () => ({ sort: "starred", filter: "all", group: false, ...storage.get(PREFS_KEY, {}) });
+let editingCategories = false; // per visit, not remembered
+const setPrefs = (patch) => storage.set(PREFS_KEY, { ...getPrefs(), ...patch });
+
+const newCountOf = (c) => {
+  const seen = lastSeen(c);
+  return c.filings.filter((f) => f.filing_seq > seen).length;
+};
+const latestOf = (c) => c.filings[0]?.date || "";
+const SORTS = {
+  starred: { label: "Starred first", cmp: (a, b) => isStarred(b) - isStarred(a) || latestOf(b).localeCompare(latestOf(a)) },
+  latest: { label: "Latest filing", cmp: (a, b) => latestOf(b).localeCompare(latestOf(a)) },
+  new: { label: "Most new filings", cmp: (a, b) => newCountOf(b) - newCountOf(a) || latestOf(b).localeCompare(latestOf(a)) },
+  added: { label: "Recently added", cmp: (a, b) => (b.added_at || "").localeCompare(a.added_at || "") },
+  case: { label: "Case number", cmp: (a, b) => a.case.localeCompare(b.case) },
+};
 
 function filingRow(f, seen) {
   const doc = f.documents[0] || {};
@@ -257,13 +384,13 @@ function filingRow(f, seen) {
 function watchCard(c) {
   const m = c.meta || {};
   const seen = lastSeen(c);
-  const newCount = c.filings.filter((f) => f.filing_seq > seen).length;
+  const newCount = newCountOf(c);
   const kind = [m.industry, m.subtype || m.type].filter(Boolean).join(" · ");
   const latest = c.filings[0]?.date;
   const rel = relDay(latest);
-  return `<article class="watch" data-case="${esc(c.case)}">
+  return `<article class="watch${isStarred(c) ? " starred" : ""}" data-case="${esc(c.case)}">
     <div class="watch-side">
-      <a class="caseno" href="#/case/${esc(c.case)}">${esc(c.case)}</a>
+      <div class="caseline">${starButton(c)}<a class="caseno" href="#/case/${esc(c.case)}">${esc(c.case)}</a></div>
       <div class="kicker">${esc(kind)}</div>
       ${
         pendingFor(c.case)
@@ -277,22 +404,77 @@ function watchCard(c) {
     <div class="watch-main">
       <h2><a href="#/case/${esc(c.case)}">${esc(m.title || c.case)}</a></h2>
       <div class="who">${esc(m.companies || "")}</div>
+      ${categoryPills(c)}
       <ul class="filings">${c.filings.slice(0, 6).map((f) => filingRow(f, seen)).join("")}</ul>
       <div class="actions">
         <a class="textbtn" href="#/case/${esc(c.case)}">All ${c.filings.length.toLocaleString()} filings</a>
         ${newCount ? `<button class="textbtn" data-act="seen">Mark as read</button>` : ""}
         <a class="textbtn quiet" href="${esc(m.url)}" target="_blank" rel="noopener">Open on DPS ↗</a>
-        ${pendingFor(c.case) ? "" : `<button class="textbtn quiet" data-act="untrack">Stop tracking</button>`}
+        ${pendingFor(c.case) ? "" : `<button class="textbtn quiet" data-act="untrack" data-case="${esc(c.case)}">Stop tracking</button>`}
       </div>
     </div>
   </article>`;
 }
 
+function toolbar(cases) {
+  const prefs = getPrefs();
+  const cats = allCategories();
+  const count = (pred) => cases.filter(pred).length;
+  const chip = (filter, label, n, extra = "") =>
+    `<button class="chip${lc(prefs.filter) === lc(filter) ? " on" : ""}" data-act="filter" data-filter="${esc(filter)}">${label}<span class="n">${n}</span></button>${extra}`;
+  return `<div class="toolbar">
+    <div class="chips">
+      ${chip("all", "All", cases.length)}
+      ${chip("starred", "★ Starred", count(isStarred))}
+      ${cats
+        .map((n) =>
+          chip(`cat:${n}`, esc(n), count((c) => categoriesOf(c).some((x) => lc(x) === lc(n))),
+            editingCategories ? `<button class="chip-x" data-act="delcat" data-name="${esc(n)}" aria-label="Delete category ${esc(n)}">×</button>` : "")
+        )
+        .join("")}
+      ${cats.length ? chip("none", "Uncategorized", count((c) => !categoriesOf(c).length)) : ""}
+      <button class="chip ghost" data-act="newcat">+ New category</button>
+      ${cats.length ? `<button class="textbtn quiet" data-act="editcats">${editingCategories ? "Done" : "Edit categories"}</button>` : ""}
+    </div>
+    <div class="sorts">
+      <label>Sort <select id="sort">${Object.entries(SORTS)
+        .map(([k, v]) => `<option value="${k}"${prefs.sort === k ? " selected" : ""}>${v.label}</option>`)
+        .join("")}</select></label>
+      <label class="check"><input type="checkbox" id="group"${prefs.group ? " checked" : ""}> Group by category</label>
+    </div>
+  </div>`;
+}
+
 function renderWatchlist() {
   setNav("watch");
-  const cases = [...DATA.cases].sort((a, b) => (b.filings[0]?.date || "").localeCompare(a.filings[0]?.date || ""));
-  const totalNew = cases.reduce((n, c) => n + c.filings.filter((f) => f.filing_seq > lastSeen(c)).length, 0);
+  const prefs = getPrefs();
+  const all = DATA.cases;
+  const cats = allCategories();
+  let filter = prefs.filter;
+  if (filter.startsWith("cat:") && !cats.some((n) => lc(`cat:${n}`) === lc(filter))) filter = "all";
+  const matches = (c) =>
+    filter === "starred" ? isStarred(c) :
+    filter === "none" ? !categoriesOf(c).length :
+    filter.startsWith("cat:") ? categoriesOf(c).some((x) => lc(x) === lc(filter.slice(4))) : true;
+  const cases = all.filter(matches).sort((SORTS[prefs.sort] || SORTS.starred).cmp);
+  const totalNew = all.reduce((n, c) => n + newCountOf(c), 0);
   const adding = pending().filter((p) => p.action === "track");
+
+  let body;
+  if (!all.length && !adding.length) {
+    body = `<div class="empty"><p><strong>Nothing tracked yet.</strong> Add a case number above.</p></div>`;
+  } else if (!cases.length) {
+    body = `<div class="empty"><p>No tracked cases match this filter.</p></div>`;
+  } else if (prefs.group && cats.length) {
+    const groups = cats
+      .map((n) => ({ name: n, items: cases.filter((c) => categoriesOf(c).some((x) => lc(x) === lc(n))) }))
+      .concat([{ name: "Uncategorized", items: cases.filter((c) => !categoriesOf(c).length) }])
+      .filter((g) => g.items.length);
+    body = groups.map((g) => `<h3 class="group-head">${esc(g.name)} <span>${g.items.length}</span></h3>${g.items.map(watchCard).join("")}`).join("");
+  } else {
+    body = cases.map(watchCard).join("");
+  }
+
   view.innerHTML = `
     <form class="track" id="track">
       <label for="cases">Track a proceeding</label>
@@ -300,31 +482,34 @@ function renderWatchlist() {
         <input id="cases" name="cases" autocomplete="off" placeholder="25-E-0375" required>
         <button class="btn" type="submit">Track</button>
       </div>
-      <p class="hint">One or more PSC case numbers, separated by commas. The request goes to the Slack channel, the bot confirms there, and the case appears here in a few minutes. You can also post <code>track 25-E-0375</code> in Slack.</p>
+      <p class="hint">One or more PSC case numbers, separated by commas. The request goes to your Slack channel, the bot confirms there, and the case appears here in a few minutes. You can also post <code>track 25-E-0375</code> in Slack.</p>
       <div class="problems" id="problems"></div>
     </form>
     <h2 class="section-head">Tracked cases</h2>
+    ${all.length ? toolbar(all) : ""}
     ${adding
       .map(
         (p) => `<article class="watch pending"><div class="watch-side"><span class="caseno">${esc(p.case)}</span><span class="tag ink">Adding…</span></div>
         <div class="watch-main"><p class="who">Requested ${Math.max(1, Math.round((Date.now() - p.at) / 6e4))} min ago. The bot confirms in Slack (or says if the case doesn't exist), and the full history appears here once the dashboard rebuilds, usually within five minutes. This page checks automatically.</p></div></article>`
       )
       .join("")}
-    ${
-      !cases.length && !adding.length
-        ? `<div class="empty"><p><strong>Nothing tracked yet.</strong> Add a case number above.</p></div>`
-        : (totalNew
-            ? `<p class="dek"><strong>${totalNew} new filing${totalNew === 1 ? "" : "s"}</strong> since your last visit.</p>`
-            : `<p class="dek">No new filings in the ${cases.length} tracked case${cases.length === 1 ? "" : "s"} since your last visit.</p>`) +
-          cases.map(watchCard).join("")
-    }`;
+    ${all.length ? (totalNew
+      ? `<p class="dek"><strong>${totalNew} new filing${totalNew === 1 ? "" : "s"}</strong> since your last visit.</p>`
+      : `<p class="dek">No new filings in the ${all.length} tracked case${all.length === 1 ? "" : "s"} since your last visit.</p>`) : ""}
+    ${body}`;
+
   document.getElementById("track").addEventListener("submit", onTrack);
-  view.querySelectorAll('[data-act="untrack"]').forEach((btn) =>
-    btn.addEventListener("click", () => onUntrack(btn.closest(".watch").dataset.case))
-  );
+  document.getElementById("sort")?.addEventListener("change", (e) => {
+    setPrefs({ sort: e.target.value });
+    renderWatchlist();
+  });
+  document.getElementById("group")?.addEventListener("change", (e) => {
+    setPrefs({ group: e.target.checked });
+    renderWatchlist();
+  });
   view.querySelectorAll('[data-act="seen"]').forEach((btn) =>
     btn.addEventListener("click", () => {
-      markSeen(DATA.cases.find((c) => c.case === btn.closest(".watch").dataset.case));
+      markSeen(caseObj(btn.closest(".watch").dataset.case));
       renderWatchlist();
     })
   );
@@ -359,7 +544,8 @@ function renderCase(caseNo) {
     <a class="textbtn back" href="#/">← Tracked cases</a>
     <header class="case-head">
       <div class="kicker">${esc([m.industry, m.type, m.subtype].filter(Boolean).join(" · "))}</div>
-      <h1>${esc(m.title)}</h1>
+      <div class="title-row">${starButton(c)}<h1>${esc(m.title)}</h1></div>
+      ${categoryPills(c)}
       <dl class="facts">
         <div><dt>Case</dt><dd class="caseno">${esc(c.case)}</dd></div>
         <div><dt>Parties</dt><dd>${esc(m.companies || "—")}</dd></div>
@@ -369,7 +555,7 @@ function renderCase(caseNo) {
       <div class="case-actions">
         <a class="btn ghost" href="${esc(m.url)}" target="_blank" rel="noopener">Open on DPS ↗</a>
         <span class="kicker">Tracked since ${esc(shortDate(c.added_at))}</span>
-        ${pendingFor(c.case) ? `<span class="tag ink">Removing…</span>` : `<button class="textbtn quiet" id="untrackbtn">Stop tracking</button>`}
+        ${pendingFor(c.case) ? `<span class="tag ink">Removing…</span>` : `<button class="textbtn quiet" data-act="untrack" data-case="${esc(c.case)}">Stop tracking</button>`}
       </div>
     </header>
     <div class="filters">
@@ -424,7 +610,6 @@ function renderCase(caseNo) {
   };
   draw();
   markSeen(c); // opening the full case counts as reading it
-  document.getElementById("untrackbtn")?.addEventListener("click", () => onUntrack(c.case));
 
   document.getElementById("q").addEventListener("input", (e) => {
     state.q = e.target.value;

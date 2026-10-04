@@ -208,15 +208,50 @@ a.doc:hover { text-decoration-color: var(--gold); text-decoration-thickness: 3px
 }
 
 /* Lock screen and Slack how-to */
-body.locked nav, body.locked #lockbtn, body.locked #updated { display: none; }
+body.locked nav, body.locked #updated { display: none; }
 .lock { max-width: 520px; margin: 60px auto 0; }
 .lock .remember input { flex: none; width: auto; padding: 0; border: 0; margin: 0; accent-color: var(--ink); }
 .lock .remember { display: flex; gap: 8px; align-items: center; margin: 12px 0 0; font-family: var(--serif); font-size: 15px; font-weight: 400; letter-spacing: 0; text-transform: none; }
 .howto p { margin: 0; font-size: 16px; max-width: 46em; }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88em; background: #fff; border: 1px solid var(--rule); padding: 1px 5px; }
-#lockbtn { margin-left: 8px; }
 #updated:not(:empty)::after { content: " ·"; }
 .item .side .caseno { margin-top: 0; }
 .watch.pending { background: linear-gradient(90deg, var(--cream), transparent 80%); padding-left: 12px; }
 .watch.pending .who { margin: 0; }
 .track .hint code { font-size: .85em; }
+
+/* Stars, categories, sorting */
+.star { background: none; border: 0; padding: 0 2px; cursor: pointer; font-size: 26px; line-height: 1; color: #b9b3a3; }
+.star:hover { color: var(--gold-deep); }
+.star.on { color: var(--gold); text-shadow: 0 0 0 var(--ink); -webkit-text-stroke: .6px var(--ink); }
+.caseline { display: flex; align-items: center; gap: 6px; }
+.title-row { display: flex; align-items: flex-start; gap: 8px; }
+.title-row .star { font-size: 34px; margin-top: 10px; }
+.watch.starred { box-shadow: inset 4px 0 0 var(--gold); padding-left: 14px; }
+
+.pills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.pill {
+  display: inline-flex; align-items: center; gap: 4px; font-family: var(--cond); font-weight: 600;
+  font-size: 14px; letter-spacing: .05em; text-transform: uppercase; background: var(--cream);
+  border: 1.5px solid var(--ink); padding: 1px 4px 1px 9px; line-height: 1.5;
+}
+.pill button { background: none; border: 0; cursor: pointer; font-size: 16px; line-height: 1; padding: 0 3px; color: var(--muted); }
+.pill button:hover { color: var(--alert); }
+.pill.add { cursor: pointer; background: transparent; border-style: dashed; color: var(--ink-2); padding-right: 9px; }
+.pill.add:hover { background: var(--cream); border-style: solid; }
+.catform { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.catform input { font-family: var(--serif); font-size: 16px; padding: 5px 9px; border: 2px solid var(--ink); border-radius: 0; min-width: 0; flex: 0 1 260px; }
+.catform input:focus { outline: 3px solid var(--gold); outline-offset: 0; }
+.btn.small { font-size: 15px; padding: 4px 14px; }
+
+.toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 24px; padding: 16px 0 4px; }
+.toolbar .chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.chip.ghost { border-style: dashed; }
+.chip-x { margin-left: -9px; border: 1.5px solid var(--ink); border-left: 0; background: #fff; cursor: pointer; font-size: 15px; padding: 3px 7px; color: var(--alert); }
+.sorts { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; font-family: var(--cond); font-weight: 600; font-size: 14px; letter-spacing: .06em; text-transform: uppercase; }
+.sorts select { font-family: var(--serif); font-size: 15px; text-transform: none; letter-spacing: 0; border: 1.5px solid var(--ink); border-radius: 0; padding: 4px 6px; background: #fff; margin-left: 6px; }
+.sorts .check { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.sorts .check input { accent-color: var(--ink); }
+.group-head { font-family: var(--cond); font-weight: 700; font-size: 19px; letter-spacing: .06em; text-transform: uppercase; margin: 30px 0 0; padding: 4px 10px; background: var(--ink); color: #fff; display: inline-block; }
+.group-head span { color: var(--gold); margin-left: 6px; }
+@media (max-width: 720px) { .watch.starred { padding-left: 12px; } .title-row .star { margin-top: 4px; } }
