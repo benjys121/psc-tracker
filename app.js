@@ -216,7 +216,7 @@ async function sendCommand(action, cases = [], names = []) {
   await fetch(DATA.webhook, {
     method: "POST",
     mode: "no-cors",
-    body: new URLSearchParams({ payload: JSON.stringify({ text: `${text} — ${MARKER}` }) }),
+    body: new URLSearchParams({ payload: JSON.stringify({ text: `${text} — ${DATA.marker || MARKER}` }) }),
   });
   const ops = [];
   if (cases.length && names.length) cases.forEach((c) => names.forEach((n) => ops.push({ action, case: c, name: n })));
